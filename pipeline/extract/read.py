@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from typing import Iterable
 
 import boto3
+from bs4 import BeautifulSoup
 import pandas as pd
 import requests
 from tqdm import tqdm
@@ -21,6 +22,9 @@ POLYGON_BASE_URL = os.environ.get("POLYGON_BASE_URL", DEFAULT_CONFIG.polygon_bas
 REQUEST_TIMEOUT = int(os.environ.get("POLYGON_REQUEST_TIMEOUT", str(DEFAULT_CONFIG.request_timeout)))
 MAX_RETRIES = int(os.environ.get("POLYGON_MAX_RETRIES", str(DEFAULT_CONFIG.max_retries)))
 YEAR = int(os.environ.get("DATA_YEAR", str(DEFAULT_CONFIG.year)))
+DATA_START_DATE = os.environ.get("DATA_START_DATE")
+DATA_END_DATE = os.environ.get("DATA_END_DATE")
+LOOKBACK_DAYS = int(os.environ.get("DATA_LOOKBACK_DAYS", "2"))
 REQUEST_INTERVAL_SECONDS = float(
     os.environ.get("POLYGON_REQUEST_INTERVAL_SECONDS", str(DEFAULT_CONFIG.request_interval_seconds))
 )
@@ -43,14 +47,15 @@ DATA_COLUMNS = [
     "transactions",
 ]
 
-
 def _require_env(value: str | None, name: str) -> str:
+    """Raise a clear error when a required environment variable is missing."""
     if not value:
         raise ValueError(f"{name} is required.")
     return value
 
 
 def get_sp500_symbols() -> list[str]:
+    """Scrape the current S&P 500 constituent tickers from Wikipedia."""
     response = requests.get(
         WIKI_URL,
         headers={
@@ -58,18 +63,38 @@ def get_sp500_symbols() -> list[str]:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/128.0.0.0 Safari/537.36"
-            )
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         },
         timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
-    tables = pd.read_html(response.text)
-    constituents = tables[0]
-    symbols = constituents["Symbol"].astype(str).str.replace(".", "-", regex=False)
-    return sorted(symbols.unique().tolist())
+    soup = BeautifulSoup(response.text, "html.parser")
+    table = soup.find("table", {"id": "constituents"})
+    if table is None:
+        raise RuntimeError("Could not find the S&P 500 constituents table on Wikipedia.")
+
+    headers = [th.get_text(strip=True) for th in table.find_all("th")]
+    try:
+        symbol_index = headers.index("Symbol")
+    except ValueError as exc:
+        raise RuntimeError("S&P 500 constituents table does not contain a Symbol column.") from exc
+
+    symbols: list[str] = []
+    for row in table.find_all("tr")[1:]:
+        cells = row.find_all("td")
+        if len(cells) <= symbol_index:
+            continue
+        symbol = cells[symbol_index].get_text(strip=True).replace(".", "-")
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if not symbols:
+        raise RuntimeError("No S&P 500 symbols could be parsed from Wikipedia.")
+    return symbols
 
 
 def month_ranges(year: int) -> list[tuple[date, date]]:
+    """Return inclusive monthly date ranges for the requested year."""
     ranges: list[tuple[date, date]] = []
     current = date(year, 1, 1)
     while current.year == year:
@@ -83,12 +108,31 @@ def month_ranges(year: int) -> list[tuple[date, date]]:
     return ranges
 
 
+def selected_ranges(year: int) -> list[tuple[date, date]]:
+    """Return the configured extract ranges, preferring explicit daily bounds."""
+    if DATA_END_DATE:
+        end = date.fromisoformat(DATA_END_DATE)
+        if DATA_START_DATE:
+            start = date.fromisoformat(DATA_START_DATE)
+            if end < start:
+                raise ValueError("DATA_END_DATE must be on or after DATA_START_DATE.")
+            return [(start, end)]
+
+        windows: list[tuple[date, date]] = []
+        for offset in range(max(1, LOOKBACK_DAYS)):
+            day = end - timedelta(days=offset)
+            windows.append((day, day))
+        return windows
+    return month_ranges(year)
+
+
 def fetch_polygon_minute_bars(
     session: requests.Session,
     ticker: str,
     start_date: date,
     end_date: date,
 ) -> list[dict]:
+    """Fetch Polygon minute bars for one ticker and one date range."""
     url = (
         f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/"
         f"{start_date.isoformat()}/{end_date.isoformat()}"
@@ -118,7 +162,34 @@ def fetch_polygon_minute_bars(
     )
 
 
+def fetch_polygon_minute_bars_or_empty(
+    session: requests.Session,
+    ticker: str,
+    start_date: date,
+    end_date: date,
+) -> list[dict]:
+    """Fetch minute bars, returning an empty list when Polygon has no data yet."""
+    try:
+        results = fetch_polygon_minute_bars(session, ticker, start_date, end_date)
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is not None and response.status_code in {404, 429}:
+            print(
+                f"Skipping {ticker} {start_date.isoformat()} to {end_date.isoformat()} "
+                f"because Polygon returned {response.status_code}."
+            )
+            return []
+        raise
+    if not results:
+        print(
+            f"Skipping {ticker} {start_date.isoformat()} to {end_date.isoformat()} "
+            "because Polygon returned no results."
+        )
+    return results
+
+
 def results_to_rows(ticker: str, results: Iterable[dict]) -> list[dict]:
+    """Convert Polygon aggregate results into the canonical row structure."""
     rows: list[dict] = []
     for row in results:
         timestamp = pd.to_datetime(row["t"], unit="ms", utc=True)
@@ -140,6 +211,7 @@ def results_to_rows(ticker: str, results: Iterable[dict]) -> list[dict]:
 
 
 def window_key(prefix: str, ticker: str, start_date: date, end_date: date) -> str:
+    """Build the S3 object key for one ticker window."""
     suffix = "parquet" if S3_FORMAT == "parquet" else "csv"
     return (
         f"{prefix.rstrip('/')}/{ticker}/"
@@ -156,6 +228,7 @@ def upload_window_to_s3(
     end_date: date,
     rows: list[dict],
 ) -> str:
+    """Serialize one window of rows and upload it to S3."""
     object_key = window_key(prefix, ticker, start_date, end_date)
     frame = pd.DataFrame(rows, columns=DATA_COLUMNS)
 
@@ -182,12 +255,23 @@ def upload_window_to_s3(
 
 
 def load_checkpoint(s3, bucket: str, checkpoint_key: str) -> dict:
+    """Load the extract checkpoint or return a fresh default state."""
     try:
         response = s3.get_object(Bucket=bucket, Key=checkpoint_key)
     except s3.exceptions.ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in {"404", "NoSuchKey", "NotFound"}:
-            return {"symbol_index": 0, "window_index": 0}
+            return {
+                "year": YEAR,
+                "s3_prefix": S3_PREFIX,
+                "s3_format": S3_FORMAT,
+                "extract_mode": "daily" if DATA_START_DATE and DATA_END_DATE else "monthly",
+                "data_start_date": DATA_START_DATE,
+                "data_end_date": DATA_END_DATE,
+                "processed_symbols": [],
+                "current_symbol": None,
+                "window_index": 0,
+            }
         raise
 
     payload = json.loads(response["Body"].read().decode("utf-8"))
@@ -195,6 +279,12 @@ def load_checkpoint(s3, bucket: str, checkpoint_key: str) -> dict:
         "year": int(payload.get("year", YEAR)),
         "s3_prefix": payload.get("s3_prefix", S3_PREFIX),
         "s3_format": payload.get("s3_format", S3_FORMAT),
+        "extract_mode": payload.get(
+            "extract_mode",
+            "daily" if DATA_START_DATE and DATA_END_DATE else "monthly",
+        ),
+        "data_start_date": payload.get("data_start_date", DATA_START_DATE),
+        "data_end_date": payload.get("data_end_date", DATA_END_DATE),
         "processed_symbols": list(payload.get("processed_symbols", [])),
         "current_symbol": payload.get("current_symbol"),
         "window_index": int(payload.get("window_index", 0)),
@@ -205,18 +295,25 @@ def save_checkpoint(
     s3,
     bucket: str,
     checkpoint_key: str,
+    extract_mode: str,
+    data_start_date: str | None,
+    data_end_date: str | None,
     processed_symbols: list[str],
     current_symbol: str | None,
     window_index: int,
 ) -> None:
+    """Persist the extract checkpoint so the job can resume safely."""
     payload = {
         "year": YEAR,
         "s3_prefix": S3_PREFIX,
         "s3_format": S3_FORMAT,
+        "extract_mode": extract_mode,
+        "data_start_date": data_start_date,
+        "data_end_date": data_end_date,
         "processed_symbols": processed_symbols,
         "current_symbol": current_symbol,
         "window_index": window_index,
-        "updated_at_utc": pd.Timestamp.utcnow().isoformat(),
+        "updated_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
     }
     s3.put_object(
         Bucket=bucket,
@@ -226,12 +323,13 @@ def save_checkpoint(
     )
 
 
-def main() -> None:
+def run_extract() -> None:
+    """Run the extract job end to end and upload rows to S3."""
     _require_env(POLYGON_API_KEY, "POLYGON_API_KEY")
     bucket = _require_env(S3_BUCKET, "S3_BUCKET")
 
     symbols = get_sp500_symbols()
-    windows = month_ranges(YEAR)
+    windows = selected_ranges(YEAR)
     s3 = boto3.client("s3")
     session = requests.Session()
     checkpoint = load_checkpoint(s3, bucket, CHECKPOINT_KEY)
@@ -240,6 +338,15 @@ def main() -> None:
             "Checkpoint configuration does not match the current run. "
             f"checkpoint(year={checkpoint['year']}, prefix={checkpoint['s3_prefix']}, format={checkpoint['s3_format']}) "
             f"!= run(year={YEAR}, prefix={S3_PREFIX}, format={S3_FORMAT})."
+        )
+    expected_mode = "daily" if DATA_START_DATE and DATA_END_DATE else "monthly"
+    if checkpoint["extract_mode"] != expected_mode:
+        raise ValueError(
+            f"Checkpoint extract mode {checkpoint['extract_mode']} does not match current run mode {expected_mode}."
+        )
+    if checkpoint["data_start_date"] != DATA_START_DATE or checkpoint["data_end_date"] != DATA_END_DATE:
+        raise ValueError(
+            "Checkpoint date window does not match the current run window."
         )
 
     processed_symbols = set(str(symbol) for symbol in checkpoint["processed_symbols"])
@@ -253,9 +360,10 @@ def main() -> None:
     completed_steps = sum(1 for symbol in symbols if symbol in processed_symbols) * len(windows) + start_window_index
 
     total_steps = len(symbols) * len(windows)
+    extracted_object_keys: list[str] = []
     print(
         f"Starting run for {len(symbols)} S&P 500 symbols in {YEAR}: "
-        f"{len(windows)} monthly windows each, format {S3_FORMAT}, "
+        f"{len(windows)} date window(s), format {S3_FORMAT}, "
         f"request interval {REQUEST_INTERVAL_SECONDS:.1f}s, "
         f"resume symbol {start_symbol_index}, window {start_window_index}"
     )
@@ -267,10 +375,11 @@ def main() -> None:
         for symbol_index, symbol in enumerate(symbols[start_symbol_index:], start=start_symbol_index):
             window_start = start_window_index if symbol_index == start_symbol_index else 0
             for window_index, (start_date, end_date) in enumerate(windows[window_start:], start=window_start):
-                rows = results_to_rows(
-                    symbol,
-                    fetch_polygon_minute_bars(session, symbol, start_date, end_date),
-                )
+                raw_results = fetch_polygon_minute_bars_or_empty(session, symbol, start_date, end_date)
+                if not raw_results:
+                    progress.update(1)
+                    continue
+                rows = results_to_rows(symbol, raw_results)
                 object_key = upload_window_to_s3(
                     s3,
                     bucket,
@@ -284,17 +393,20 @@ def main() -> None:
                     f"Uploaded {symbol} {start_date.isoformat()} to {end_date.isoformat()} "
                     f"({len(rows):,} rows) -> s3://{bucket}/{object_key}"
                 )
-                rows = []
+                extracted_object_keys.append(object_key)
                 save_checkpoint(
                     s3,
                     bucket,
                     CHECKPOINT_KEY,
+                    expected_mode,
+                    DATA_START_DATE,
+                    DATA_END_DATE,
                     sorted(processed_symbols),
                     symbol,
                     window_index + 1,
                 )
-                time.sleep(REQUEST_INTERVAL_SECONDS)
                 progress.update(1)
+                time.sleep(REQUEST_INTERVAL_SECONDS)
             start_window_index = 0
             processed_symbols.add(symbol)
             next_symbol = symbols[symbol_index + 1] if symbol_index + 1 < len(symbols) else None
@@ -302,10 +414,24 @@ def main() -> None:
                 s3,
                 bucket,
                 CHECKPOINT_KEY,
+                expected_mode,
+                DATA_START_DATE,
+                DATA_END_DATE,
                 sorted(processed_symbols),
                 next_symbol,
                 0,
             )
+
+    print(
+        "Extract complete: "
+        f"{len(symbols)} symbols, {len(windows)} windows, "
+        f"{len(extracted_object_keys)} uploaded objects."
+    )
+
+
+def main() -> None:
+    """Run the extract job end to end."""
+    run_extract()
 
 
 if __name__ == "__main__":

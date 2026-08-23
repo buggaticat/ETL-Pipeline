@@ -6,6 +6,8 @@ from datetime import date
 
 @dataclass(frozen=True)
 class ExtractConfig:
+    """Static defaults for the extract job."""
+
     year: int = 2025
     polygon_base_url: str = "https://api.polygon.io"
     request_timeout: int = 30
@@ -17,6 +19,7 @@ class ExtractConfig:
 
     @property
     def month_start(self) -> date:
+        """Return the first day of the configured extract year."""
         return date(self.year, 1, 1)
 
 
