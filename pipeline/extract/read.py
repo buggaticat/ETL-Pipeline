@@ -9,6 +9,7 @@ import boto3
 from bs4 import BeautifulSoup
 import pandas as pd
 import requests
+from requests import exceptions as requests_exceptions
 from tqdm import tqdm
 
 from .config import DEFAULT_CONFIG
@@ -145,17 +146,37 @@ def fetch_polygon_minute_bars(
     }
 
     for attempt in range(1, MAX_RETRIES + 1):
-        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        if response.status_code == 429:
-            time.sleep(REQUEST_INTERVAL_SECONDS)
-            continue
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("status") != "OK":
-            raise RuntimeError(
-                f"Polygon request failed for {ticker} {start_date} to {end_date}: {payload}"
+        try:
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 429:
+                print(
+                    f"Polygon rate limited for {ticker} {start_date.isoformat()} to {end_date.isoformat()} "
+                    f"on attempt {attempt}/{MAX_RETRIES}."
+                )
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("status") != "OK":
+                raise RuntimeError(
+                    f"Polygon request failed for {ticker} {start_date} to {end_date}: {payload}"
+                )
+            return payload.get("results", [])
+        except (requests_exceptions.ReadTimeout, requests_exceptions.Timeout) as exc:
+            print(
+                f"Polygon timed out for {ticker} {start_date.isoformat()} to {end_date.isoformat()} "
+                f"on attempt {attempt}/{MAX_RETRIES}: {exc}"
             )
-        return payload.get("results", [])
+        except requests_exceptions.RequestException as exc:
+            if getattr(exc, "response", None) is not None and exc.response.status_code == 429:
+                print(
+                    f"Polygon rate limited for {ticker} {start_date.isoformat()} to {end_date.isoformat()} "
+                    f"on attempt {attempt}/{MAX_RETRIES}."
+                )
+            else:
+                raise
+
+        if attempt < MAX_RETRIES:
+            time.sleep(REQUEST_INTERVAL_SECONDS * attempt)
 
     raise RuntimeError(
         f"Polygon rate limit retries exhausted for {ticker} {start_date} to {end_date}."
@@ -180,6 +201,9 @@ def fetch_polygon_minute_bars_or_empty(
             )
             return []
         raise
+    finally:
+        time.sleep(REQUEST_INTERVAL_SECONDS)
+
     if not results:
         print(
             f"Skipping {ticker} {start_date.isoformat()} to {end_date.isoformat()} "
@@ -406,7 +430,6 @@ def run_extract() -> None:
                     window_index + 1,
                 )
                 progress.update(1)
-                time.sleep(REQUEST_INTERVAL_SECONDS)
             start_window_index = 0
             processed_symbols.add(symbol)
             next_symbol = symbols[symbol_index + 1] if symbol_index + 1 < len(symbols) else None
