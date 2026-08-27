@@ -5,13 +5,15 @@ import time
 from datetime import date, timedelta
 from typing import Iterable
 
-import boto3
 from bs4 import BeautifulSoup
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 from requests import exceptions as requests_exceptions
 from tqdm import tqdm
 
+from ..aws_auth import build_aws_session
 from .config import DEFAULT_CONFIG
 
 
@@ -46,7 +48,31 @@ DATA_COLUMNS = [
     "volume",
     "vwap",
     "transactions",
+    "company_name",
+    "sector",
+    "industry",
+    "exchange",
 ]
+
+INTEGER_COLUMNS = ["volume", "transactions"]
+PARQUET_SCHEMA = pa.schema(
+    [
+        pa.field("ticker", pa.string()),
+        pa.field("timestamp_utc", pa.string()),
+        pa.field("date", pa.string()),
+        pa.field("open", pa.float64()),
+        pa.field("high", pa.float64()),
+        pa.field("low", pa.float64()),
+        pa.field("close", pa.float64()),
+        pa.field("volume", pa.int64()),
+        pa.field("vwap", pa.float64()),
+        pa.field("transactions", pa.int64()),
+        pa.field("company_name", pa.string()),
+        pa.field("sector", pa.string()),
+        pa.field("industry", pa.string()),
+        pa.field("exchange", pa.string()),
+    ]
+)
 
 def _require_env(value: str | None, name: str) -> str:
     """Raise a clear error when a required environment variable is missing."""
@@ -75,7 +101,10 @@ def get_sp500_symbols() -> list[str]:
     if table is None:
         raise RuntimeError("Could not find the S&P 500 constituents table on Wikipedia.")
 
-    headers = [th.get_text(strip=True) for th in table.find_all("th")]
+    header_row = table.find("tr")
+    if header_row is None:
+        raise RuntimeError("S&P 500 constituents table is missing a header row.")
+    headers = [th.get_text(strip=True) for th in header_row.find_all("th")]
     try:
         symbol_index = headers.index("Symbol")
     except ValueError as exc:
@@ -92,6 +121,142 @@ def get_sp500_symbols() -> list[str]:
     if not symbols:
         raise RuntimeError("No S&P 500 symbols could be parsed from Wikipedia.")
     return symbols
+
+
+def _load_wikipedia_constituent_metadata() -> dict[str, dict[str, str]]:
+    """Scrape company metadata from Wikipedia for fallback use."""
+    response = requests.get(
+        WIKI_URL,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    table = soup.find("table", {"id": "constituents"})
+    if table is None:
+        raise RuntimeError("Could not find the S&P 500 constituents table on Wikipedia.")
+
+    header_row = table.find("tr")
+    if header_row is None:
+        raise RuntimeError("S&P 500 constituents table is missing a header row.")
+    headers = [th.get_text(strip=True) for th in header_row.find_all("th")]
+    try:
+        symbol_index = headers.index("Symbol")
+        company_index = headers.index("Security")
+        sector_index = headers.index("GICS Sector")
+        industry_index = headers.index("GICS Sub-Industry")
+    except ValueError as exc:
+        raise RuntimeError(
+            "S&P 500 constituents table is missing one of the expected metadata columns."
+        ) from exc
+
+    metadata: dict[str, dict[str, str]] = {}
+    for row in table.find_all("tr")[1:]:
+        cells = row.find_all("td")
+        if len(cells) <= max(symbol_index, company_index, sector_index, industry_index):
+            continue
+        symbol = cells[symbol_index].get_text(strip=True).replace(".", "-")
+        if symbol and symbol not in metadata:
+            metadata[symbol] = {
+                "company_name": cells[company_index].get_text(strip=True),
+                "sector": cells[sector_index].get_text(strip=True),
+                "industry": cells[industry_index].get_text(strip=True),
+            }
+    return metadata
+
+
+def _normalize_polygon_ticker_details(payload: dict) -> dict[str, str | None]:
+    """Normalize Polygon ticker details into the metadata columns we load downstream."""
+    result = payload.get("results")
+    if isinstance(result, list):
+        result = result[0] if result else {}
+    elif isinstance(result, dict):
+        result = result
+    elif "ticker" in payload:
+        result = payload
+    else:
+        result = {}
+
+    company_name = result.get("name")
+    return {
+        "company_name": company_name,
+        "exchange": result.get("primary_exchange"),
+    }
+
+
+def fetch_polygon_ticker_metadata(
+    session: requests.Session,
+    ticker: str,
+) -> dict[str, str | None]:
+    """Fetch ticker metadata from Polygon's reference data endpoints."""
+    candidates = [
+        (
+            f"{POLYGON_BASE_URL}/v3/reference/tickers",
+            {
+                "ticker": ticker,
+                "limit": 1,
+                "active": "true",
+                "apiKey": POLYGON_API_KEY,
+            },
+        ),
+        (
+            f"{POLYGON_BASE_URL}/v3/reference/tickers/{ticker}",
+            {"apiKey": POLYGON_API_KEY},
+        ),
+    ]
+
+    best_metadata: dict[str, str | None] | None = None
+    best_score = -1
+
+    for url, params in candidates:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                if getattr(response, "status_code", 200) == 429:
+                    print(
+                        f"Polygon reference lookup rate limited for {ticker} "
+                        f"on attempt {attempt}/{MAX_RETRIES}."
+                    )
+                    continue
+                response.raise_for_status()
+                payload = response.json()
+                metadata = _normalize_polygon_ticker_details(payload)
+                score = sum(
+                    1
+                    for value in metadata.values()
+                    if value is not None and value != "Unknown"
+                )
+                if score > best_score:
+                    best_metadata = metadata
+                    best_score = score
+                break
+            except (requests_exceptions.ReadTimeout, requests_exceptions.Timeout) as exc:
+                print(
+                    f"Polygon reference lookup timed out for {ticker} "
+                    f"on attempt {attempt}/{MAX_RETRIES}: {exc}"
+                )
+            except requests_exceptions.RequestException as exc:
+                if getattr(exc, "response", None) is not None and exc.response.status_code == 429:
+                    print(
+                        f"Polygon reference lookup rate limited for {ticker} "
+                        f"on attempt {attempt}/{MAX_RETRIES}."
+                    )
+                else:
+                    if url.endswith(f"/{ticker}") and getattr(exc, "response", None) is not None:
+                        break
+                    raise
+
+            if attempt < MAX_RETRIES:
+                time.sleep(REQUEST_INTERVAL_SECONDS * attempt)
+
+    return best_metadata or {"company_name": None, "exchange": None}
 
 
 def month_ranges(year: int) -> list[tuple[date, date]]:
@@ -212,8 +377,13 @@ def fetch_polygon_minute_bars_or_empty(
     return results
 
 
-def results_to_rows(ticker: str, results: Iterable[dict]) -> list[dict]:
+def results_to_rows(
+    ticker: str,
+    results: Iterable[dict],
+    metadata: dict[str, str | None] | None = None,
+) -> list[dict]:
     """Convert Polygon aggregate results into the canonical row structure."""
+    metadata = metadata or {}
     rows: list[dict] = []
     for row in results:
         timestamp = pd.to_datetime(row["t"], unit="ms", utc=True)
@@ -229,6 +399,10 @@ def results_to_rows(ticker: str, results: Iterable[dict]) -> list[dict]:
                 "volume": row.get("v"),
                 "vwap": row.get("vw"),
                 "transactions": row.get("n"),
+                "company_name": metadata.get("company_name"),
+                "sector": metadata.get("sector"),
+                "industry": metadata.get("industry"),
+                "exchange": metadata.get("exchange"),
             }
         )
     return rows
@@ -243,6 +417,16 @@ def window_key(prefix: str, ticker: str, start_date: date, end_date: date) -> st
     )
 
 
+def _normalize_output_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Force the raw extract schema to stay stable before serialization."""
+    normalized = frame.copy()
+    for column in INTEGER_COLUMNS:
+        if column in normalized.columns:
+            numeric = pd.to_numeric(normalized[column], errors="coerce")
+            normalized[column] = numeric.astype("Int64")
+    return normalized
+
+
 def upload_window_to_s3(
     s3,
     bucket: str,
@@ -254,11 +438,12 @@ def upload_window_to_s3(
 ) -> str:
     """Serialize one window of rows and upload it to S3."""
     object_key = window_key(prefix, ticker, start_date, end_date)
-    frame = pd.DataFrame(rows, columns=DATA_COLUMNS)
+    frame = _normalize_output_frame(pd.DataFrame(rows, columns=DATA_COLUMNS))
 
     if S3_FORMAT == "parquet":
         buffer = io.BytesIO()
-        frame.to_parquet(buffer, index=False)
+        table = pa.Table.from_pandas(frame, schema=PARQUET_SCHEMA, preserve_index=False)
+        pq.write_table(table, buffer)
         body = buffer.getvalue()
         content_type = "application/octet-stream"
     elif S3_FORMAT == "csv":
@@ -353,8 +538,10 @@ def run_extract() -> None:
     bucket = _require_env(S3_BUCKET, "S3_BUCKET")
 
     symbols = get_sp500_symbols()
+    wikipedia_metadata = _load_wikipedia_constituent_metadata()
     windows = selected_ranges(YEAR)
-    s3 = boto3.client("s3")
+    aws = build_aws_session()
+    s3 = aws.session.client("s3")
     session = requests.Session()
     checkpoint = load_checkpoint(s3, bucket, CHECKPOINT_KEY)
     if checkpoint["year"] != YEAR or checkpoint["s3_prefix"] != S3_PREFIX or checkpoint["s3_format"] != S3_FORMAT:
@@ -383,6 +570,17 @@ def run_extract() -> None:
     start_window_index = int(checkpoint["window_index"]) if current_symbol and current_symbol in symbols else 0
     completed_steps = sum(1 for symbol in symbols if symbol in processed_symbols) * len(windows) + start_window_index
 
+    metadata_by_symbol: dict[str, dict[str, str | None]] = {}
+    for symbol in symbols:
+        polygon_metadata = fetch_polygon_ticker_metadata(session, symbol)
+        fallback_metadata = wikipedia_metadata.get(symbol, {})
+        metadata_by_symbol[symbol] = {
+            "company_name": polygon_metadata.get("company_name") or fallback_metadata.get("company_name"),
+            "sector": fallback_metadata.get("sector"),
+            "industry": fallback_metadata.get("industry"),
+            "exchange": polygon_metadata.get("exchange"),
+        }
+
     total_steps = len(symbols) * len(windows)
     extracted_object_keys: list[str] = []
     print(
@@ -403,7 +601,7 @@ def run_extract() -> None:
                 if not raw_results:
                     progress.update(1)
                     continue
-                rows = results_to_rows(symbol, raw_results)
+                rows = results_to_rows(symbol, raw_results, metadata_by_symbol.get(symbol))
                 object_key = upload_window_to_s3(
                     s3,
                     bucket,
