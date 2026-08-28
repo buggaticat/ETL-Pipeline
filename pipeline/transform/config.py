@@ -22,12 +22,23 @@ def _env_float(name: str, default: float) -> float:
     return default if value is None else float(value)
 
 
+def _required_env(name: str) -> str:
+    value = _env(name)
+    if value is None:
+        raise ValueError(f"{name} is required.")
+    return value
+
+
+def _s3a_prefix(bucket: str, prefix: str) -> str:
+    return f"s3a://{bucket.rstrip('/')}/{prefix.lstrip('/')}"
+
+
 @dataclass(frozen=True)
 class TransformConfig:
     """Configuration values for the Spark transform job."""
 
-    source_prefix: str = "s3a://nyc-tlc/polygon/sp500/minute/2025/"
-    output_prefix: str = "s3a://nyc-tlc/polygon/sp500/minute_transformed/2025/"
+    source_prefix: str = "s3a://<bucket>/polygon/sp500/minute/2025/"
+    output_prefix: str = "s3a://<bucket>/polygon/sp500/minute_transformed/2025/"
     metadata_path: str | None = None
     year: int = 2025
     input_format: str = "parquet"
@@ -48,14 +59,17 @@ class TransformConfig:
 def load_config() -> TransformConfig:
     """Load transform configuration from environment variables."""
     year = _env_int("DATA_YEAR", 2025)
+    bucket = _required_env("S3_BUCKET")
+    raw_source_prefix = _env("S3_PREFIX", f"polygon/sp500/minute/{year}/") or f"polygon/sp500/minute/{year}/"
+    raw_output_prefix = f"polygon/sp500/minute_transformed/{year}/"
     return TransformConfig(
         source_prefix=_env(
             "TRANSFORM_SOURCE_PREFIX",
-            f"s3a://nyc-tlc/polygon/sp500/minute/{year}/",
+            _s3a_prefix(bucket, raw_source_prefix),
         ),
         output_prefix=_env(
             "TRANSFORM_OUTPUT_PREFIX",
-            f"s3a://nyc-tlc/polygon/sp500/minute_transformed/{year}/",
+            _s3a_prefix(bucket, raw_output_prefix),
         ),
         metadata_path=_env("TRANSFORM_METADATA_PATH"),
         year=year,

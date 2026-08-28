@@ -32,6 +32,13 @@ REQUEST_INTERVAL_SECONDS = float(
     os.environ.get("POLYGON_REQUEST_INTERVAL_SECONDS", str(DEFAULT_CONFIG.request_interval_seconds))
 )
 S3_FORMAT = os.environ.get("S3_FORMAT", DEFAULT_CONFIG.s3_format).strip().lower()
+POLYGON_REFERENCE_LOOKUPS_ENABLED = os.environ.get("POLYGON_REFERENCE_LOOKUPS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
 WIKI_URL = os.environ.get(
     "SP500_WIKI_URL",
     "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -123,7 +130,7 @@ def get_sp500_symbols() -> list[str]:
     return symbols
 
 
-def _load_wikipedia_constituent_metadata() -> dict[str, dict[str, str]]:
+def _load_wikipedia_constituent_metadata() -> dict[str, dict[str, str | None]]:
     """Scrape company metadata from Wikipedia for fallback use."""
     response = requests.get(
         WIKI_URL,
@@ -147,27 +154,44 @@ def _load_wikipedia_constituent_metadata() -> dict[str, dict[str, str]]:
     if header_row is None:
         raise RuntimeError("S&P 500 constituents table is missing a header row.")
     headers = [th.get_text(strip=True) for th in header_row.find_all("th")]
-    try:
-        symbol_index = headers.index("Symbol")
-        company_index = headers.index("Security")
-        sector_index = headers.index("GICS Sector")
-        industry_index = headers.index("GICS Sub-Industry")
-    except ValueError as exc:
-        raise RuntimeError(
-            "S&P 500 constituents table is missing one of the expected metadata columns."
-        ) from exc
 
-    metadata: dict[str, dict[str, str]] = {}
+    def _find_header(*candidates: str) -> int | None:
+        for candidate in candidates:
+            if candidate in headers:
+                return headers.index(candidate)
+        return None
+
+    symbol_index = _find_header("Symbol")
+    company_index = _find_header("Security", "Company", "Name")
+    sector_index = _find_header("GICS Sector", "Sector")
+    industry_index = _find_header("GICS Sub-Industry", "Sub-Industry", "Industry")
+
+    if symbol_index is None:
+        raise RuntimeError("S&P 500 constituents table is missing a Symbol column.")
+
+    metadata: dict[str, dict[str, str | None]] = {}
     for row in table.find_all("tr")[1:]:
         cells = row.find_all("td")
-        if len(cells) <= max(symbol_index, company_index, sector_index, industry_index):
+        if len(cells) <= symbol_index:
             continue
         symbol = cells[symbol_index].get_text(strip=True).replace(".", "-")
         if symbol and symbol not in metadata:
             metadata[symbol] = {
-                "company_name": cells[company_index].get_text(strip=True),
-                "sector": cells[sector_index].get_text(strip=True),
-                "industry": cells[industry_index].get_text(strip=True),
+                "company_name": (
+                    cells[company_index].get_text(strip=True)
+                    if company_index is not None and len(cells) > company_index
+                    else None
+                ),
+                "sector": (
+                    cells[sector_index].get_text(strip=True)
+                    if sector_index is not None and len(cells) > sector_index
+                    else None
+                ),
+                "industry": (
+                    cells[industry_index].get_text(strip=True)
+                    if industry_index is not None and len(cells) > industry_index
+                    else None
+                ),
             }
     return metadata
 
@@ -257,6 +281,28 @@ def fetch_polygon_ticker_metadata(
                 time.sleep(REQUEST_INTERVAL_SECONDS * attempt)
 
     return best_metadata or {"company_name": None, "exchange": None}
+
+
+def _build_metadata_by_symbol(
+    session: requests.Session,
+    symbols: list[str],
+    wikipedia_metadata: dict[str, dict[str, str | None]],
+    include_polygon_reference: bool,
+) -> dict[str, dict[str, str | None]]:
+    """Build the per-symbol metadata map used during extraction."""
+    metadata_by_symbol: dict[str, dict[str, str | None]] = {}
+    for symbol in symbols:
+        fallback_metadata = wikipedia_metadata.get(symbol, {})
+        polygon_metadata = {"company_name": None, "exchange": None}
+        if include_polygon_reference:
+            polygon_metadata = fetch_polygon_ticker_metadata(session, symbol)
+        metadata_by_symbol[symbol] = {
+            "company_name": polygon_metadata.get("company_name") or fallback_metadata.get("company_name"),
+            "sector": fallback_metadata.get("sector"),
+            "industry": fallback_metadata.get("industry"),
+            "exchange": polygon_metadata.get("exchange") if include_polygon_reference else None,
+        }
+    return metadata_by_symbol
 
 
 def month_ranges(year: int) -> list[tuple[date, date]]:
@@ -423,7 +469,7 @@ def _normalize_output_frame(frame: pd.DataFrame) -> pd.DataFrame:
     for column in INTEGER_COLUMNS:
         if column in normalized.columns:
             numeric = pd.to_numeric(normalized[column], errors="coerce")
-            normalized[column] = numeric.astype("Int64")
+            normalized[column] = numeric.round().astype("Int64")
     return normalized
 
 
@@ -532,6 +578,21 @@ def save_checkpoint(
     )
 
 
+def _fresh_checkpoint_state() -> dict[str, object]:
+    """Return the default checkpoint state for the current run."""
+    return {
+        "year": YEAR,
+        "s3_prefix": S3_PREFIX,
+        "s3_format": S3_FORMAT,
+        "extract_mode": "daily" if DATA_START_DATE and DATA_END_DATE else "monthly",
+        "data_start_date": DATA_START_DATE,
+        "data_end_date": DATA_END_DATE,
+        "processed_symbols": [],
+        "current_symbol": None,
+        "window_index": 0,
+    }
+
+
 def run_extract() -> None:
     """Run the extract job end to end and upload rows to S3."""
     _require_env(POLYGON_API_KEY, "POLYGON_API_KEY")
@@ -544,21 +605,21 @@ def run_extract() -> None:
     s3 = aws.session.client("s3")
     session = requests.Session()
     checkpoint = load_checkpoint(s3, bucket, CHECKPOINT_KEY)
-    if checkpoint["year"] != YEAR or checkpoint["s3_prefix"] != S3_PREFIX or checkpoint["s3_format"] != S3_FORMAT:
-        raise ValueError(
-            "Checkpoint configuration does not match the current run. "
-            f"checkpoint(year={checkpoint['year']}, prefix={checkpoint['s3_prefix']}, format={checkpoint['s3_format']}) "
-            f"!= run(year={YEAR}, prefix={S3_PREFIX}, format={S3_FORMAT})."
-        )
     expected_mode = "daily" if DATA_START_DATE and DATA_END_DATE else "monthly"
-    if checkpoint["extract_mode"] != expected_mode:
-        raise ValueError(
-            f"Checkpoint extract mode {checkpoint['extract_mode']} does not match current run mode {expected_mode}."
+    checkpoint_mismatch = (
+        checkpoint["year"] != YEAR
+        or checkpoint["s3_prefix"] != S3_PREFIX
+        or checkpoint["s3_format"] != S3_FORMAT
+        or checkpoint["extract_mode"] != expected_mode
+        or checkpoint["data_start_date"] != DATA_START_DATE
+        or checkpoint["data_end_date"] != DATA_END_DATE
+    )
+    if checkpoint_mismatch:
+        print(
+            "Ignoring stale checkpoint and starting fresh for the current run window.",
+            flush=True,
         )
-    if checkpoint["data_start_date"] != DATA_START_DATE or checkpoint["data_end_date"] != DATA_END_DATE:
-        raise ValueError(
-            "Checkpoint date window does not match the current run window."
-        )
+        checkpoint = _fresh_checkpoint_state()
 
     processed_symbols = set(str(symbol) for symbol in checkpoint["processed_symbols"])
     current_symbol = checkpoint["current_symbol"]
@@ -570,16 +631,12 @@ def run_extract() -> None:
     start_window_index = int(checkpoint["window_index"]) if current_symbol and current_symbol in symbols else 0
     completed_steps = sum(1 for symbol in symbols if symbol in processed_symbols) * len(windows) + start_window_index
 
-    metadata_by_symbol: dict[str, dict[str, str | None]] = {}
-    for symbol in symbols:
-        polygon_metadata = fetch_polygon_ticker_metadata(session, symbol)
-        fallback_metadata = wikipedia_metadata.get(symbol, {})
-        metadata_by_symbol[symbol] = {
-            "company_name": polygon_metadata.get("company_name") or fallback_metadata.get("company_name"),
-            "sector": fallback_metadata.get("sector"),
-            "industry": fallback_metadata.get("industry"),
-            "exchange": polygon_metadata.get("exchange"),
-        }
+    metadata_by_symbol = _build_metadata_by_symbol(
+        session,
+        symbols,
+        wikipedia_metadata,
+        include_polygon_reference=POLYGON_REFERENCE_LOOKUPS_ENABLED,
+    )
 
     total_steps = len(symbols) * len(windows)
     extracted_object_keys: list[str] = []

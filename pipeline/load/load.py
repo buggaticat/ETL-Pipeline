@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import boto3
 import snowflake.connector
 
+from ..aws_auth import build_aws_session
 from .config import LoadConfig, load_config
 
 
@@ -72,17 +72,6 @@ def _list_s3_keys(s3_client, bucket: str, prefix: str, source_format: str) -> li
     return keys
 
 
-def _aws_credentials(s3_session: boto3.Session) -> tuple[str, str, str | None]:
-    """Return frozen AWS credentials for Snowflake external stage access."""
-    credentials = s3_session.get_credentials()
-    if credentials is None:
-        raise ValueError("Unable to resolve AWS credentials for S3 access.")
-    frozen = credentials.get_frozen_credentials()
-    if not frozen.access_key or not frozen.secret_key:
-        raise ValueError("AWS access key and secret key are required for Snowflake COPY INTO.")
-    return frozen.access_key, frozen.secret_key, frozen.token
-
-
 def _file_format_sql(source_format: str) -> str:
     """Return the Snowflake file format clause for the configured source format."""
     if source_format == "parquet":
@@ -120,7 +109,8 @@ def load_transformed_data(cfg: LoadConfig | None = None) -> int:
     """Load transformed data from S3 into Snowflake and return the row count."""
     active_cfg = cfg or load_config()
     source_format = active_cfg.source_format.strip().lower()
-    s3_session = boto3.Session(region_name=active_cfg.s3_region)
+    aws = build_aws_session(region_name=active_cfg.s3_region)
+    s3_session = aws.session
     s3_client = s3_session.client("s3")
     object_keys = _list_s3_keys(s3_client, active_cfg.s3_bucket, active_cfg.s3_prefix, source_format)
     if not object_keys:
@@ -133,7 +123,7 @@ def load_transformed_data(cfg: LoadConfig | None = None) -> int:
         fully_qualified_table = (
             f"{active_cfg.snowflake_database}.{active_cfg.snowflake_schema}.{active_cfg.snowflake_table}"
         )
-        access_key, secret_key, token = _aws_credentials(s3_session)
+        access_key, secret_key, token = aws.access_key, aws.secret_key, aws.token
         stage_name = "LOAD_S3_STAGE"
         stage_url = f"s3://{active_cfg.s3_bucket}/{active_cfg.s3_prefix.rstrip('/')}/"
         pattern = rf".*\.({source_format})$"
