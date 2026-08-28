@@ -1,0 +1,11 @@
+boto3
+pyspark
+pyarrow
+tqdm
+requests
+pandas
+lxml
+beautifulsoup4
+snowflake-connector-python[pandas]
+apache-airflow
+pytest

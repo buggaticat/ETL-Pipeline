@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from airflow.providers.standard.operators.python import PythonOperator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -25,10 +24,30 @@ DEFAULT_ARGS = {
 }
 
 
+def _require_env(name: str) -> str:
+    """Raise a clear error when a required environment variable is missing."""
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f"{name} is required.")
+    return value
+
+
+def _target_date_from_context(context) -> str:
+    """Resolve the pipeline target date from the available Airflow run context."""
+    reference = (
+        context.get("data_interval_end")
+        or context.get("logical_date")
+        or context.get("run_after")
+    )
+    if reference is None:
+        reference = datetime.now(timezone.utc)
+    return (reference.date() - timedelta(days=1)).isoformat()
+
+
 def _configure_runtime_env(target_date: str) -> None:
     """Align the existing layer defaults before each task imports its module."""
     year = os.environ.get("DATA_YEAR", "2025")
-    bucket = os.environ.get("S3_BUCKET", "nyc-tlc")
+    bucket = _require_env("S3_BUCKET")
     extract_prefix = f"polygon/sp500/minute/{year}/"
     transformed_prefix = f"polygon/sp500/minute_transformed/{year}/"
 
@@ -45,7 +64,7 @@ def _configure_runtime_env(target_date: str) -> None:
 
 def run_extract(**context) -> None:
     """Run the existing Polygon extract job."""
-    target_date = (context["data_interval_end"].date() - timedelta(days=1)).isoformat()
+    target_date = _target_date_from_context(context)
     _configure_runtime_env(target_date)
     from pipeline.extract.read import run_extract as extract
 
@@ -54,7 +73,7 @@ def run_extract(**context) -> None:
 
 def run_transform(**context) -> str:
     """Run the existing Spark transform and upload job."""
-    target_date = (context["data_interval_end"].date() - timedelta(days=1)).isoformat()
+    target_date = _target_date_from_context(context)
     _configure_runtime_env(target_date)
     from pipeline.transform.upload import run_upload
 
@@ -63,7 +82,7 @@ def run_transform(**context) -> str:
 
 def run_load(**context) -> int:
     """Run the existing Snowflake load job."""
-    target_date = (context["data_interval_end"].date() - timedelta(days=1)).isoformat()
+    target_date = _target_date_from_context(context)
     _configure_runtime_env(target_date)
     from pipeline.load.load import run_load as load
 
@@ -74,8 +93,8 @@ with DAG(
     dag_id="polygon_sp500_daily_etl",
     default_args=DEFAULT_ARGS,
     description="Daily Polygon -> Spark -> Snowflake pipeline for S&P 500 minute data",
-    schedule_interval="0 2 * * *",
-    start_date=days_ago(1),
+    schedule="0 2 * * *",
+    start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
     tags=["polygon", "spark", "snowflake", "etl"],
